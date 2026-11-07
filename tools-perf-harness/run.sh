@@ -55,7 +55,7 @@ for kv in "${EXTRA[@]}"; do export "$kv"; done
 MESA_SHADER_CACHE_DIR="$MESA_DIR" \
 "$PY" "$W/repo/order1886.py" \
   --game-dir "$GAME" --state-dir "$STATE" \
-  --runtime "$INSTALL/bin/order1886-runtime" \
+  --runtime "${RUNTIME_BIN:-$INSTALL/bin/order1886-runtime}" \
   --display-mode borderless --vsync 1 --show-fps 1 --presentation-filter fsr1 \
   --frame-rate 30 --aspect-ratio original --render-width 1920 \
   --mouse-look 1 --mouse-sensitivity 100 --mouse-invert-y 0 \
