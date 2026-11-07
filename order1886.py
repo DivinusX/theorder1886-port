@@ -373,7 +373,8 @@ def timing_profile(settings):
 # Diagnostic switches that change no game behaviour; everything else ORDER1886_* is
 # set from the player's settings only.
 DIAGNOSTIC_ENVIRONMENT = frozenset({'ORDER1886_DIAG_RESOURCE_SHARPS', 'ORDER1886_FATAL_DUMP',
-                                    'ORDER1886_GPU_LOG', 'ORDER1886_PERF_DIAG'})
+                                    'ORDER1886_GPU_LOG', 'ORDER1886_PERF_DIAG',
+                                    'ORDER1886_PAD_FILE', 'ORDER1886_PAD_RECORD', 'ORDER1886_PAD_REPLAY'})
 
 
 def runtime_process_environment(runtime, inherited=None):
