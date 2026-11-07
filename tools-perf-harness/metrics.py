@@ -71,6 +71,20 @@ if intervals:
         'hitch_ms_sum': round(sum(ms - med for ms in s if ms > 2 * med), 1),
         'jitter_p95_minus_med': round(pct(s, 95) - med, 2),
     })
+    # gameplay window: the last 100 s of flips (scenario idles/looks around in-scene there)
+    if flips:
+        cutoff = flips[-1] - 100_000_000_000
+        gw = sorted((b - a) / 1e6 for a, b in zip(flips, flips[1:])
+                    if a >= cutoff and 0 < (b - a) / 1e6 <= 1000)
+        if gw:
+            gmed = statistics.median(gw)
+            gfps = sorted(1000.0 / ms for ms in gw)
+            res['game'] = {'avg_fps': round(1000.0 / statistics.mean(gw), 2),
+                           'ft_med': round(gmed, 2), 'ft_p95': round(pct(gw, 95), 2),
+                           'ft_p99': round(pct(gw, 99), 2), 'ft_max': round(gw[-1], 2),
+                           'p1_low_fps': round(pct(gfps, 1), 2),
+                           'hitches': sum(1 for ms in gw if ms > 2 * gmed),
+                           'n': len(gw)}
 
 text = open(boot, errors='replace').read() if len(boot) > 4 else ''
 for name, pat in [('pipeline_cache', r'Pipeline binary cache: .*'),

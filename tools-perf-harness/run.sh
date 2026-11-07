@@ -35,8 +35,8 @@ python3 - "$STATE/settings.json" << 'PYEOF'
 import json, sys
 p = sys.argv[1]
 s = json.load(open(p))
-s.update({'frame_rate': 30, 'fps_cap': 120, 'vsync': True, 'display_mode': 'borderless',
-          'presentation_filter': 'fsr1', 'render_width': 1920, 'output_resolution': 'automatic',
+s.update({'frame_rate': int(__import__('os').environ.get('FRAME_RATE','30')), 'fps_cap': 120, 'vsync': True, 'display_mode': 'borderless',
+          'presentation_filter': 'fsr1', 'render_width': int(__import__('os').environ.get('RENDER_WIDTH','1920')), 'output_resolution': 'automatic',
           'sharpness': 0, 'anisotropy': 1, 'frames_queued': 1, 'async_shaders': True,
           'background_warmup': False, 'parallel_warmup': False, 'speculative_readbacks': False,
           'readbacks': 'relaxed', 'button_prompts': 'playstation', 'performance_capture': True,
@@ -57,11 +57,11 @@ MESA_SHADER_CACHE_DIR="$MESA_DIR" \
   --game-dir "$GAME" --state-dir "$STATE" \
   --runtime "${RUNTIME_BIN:-$INSTALL/bin/order1886-runtime}" \
   --display-mode borderless --vsync 1 --show-fps 1 --presentation-filter fsr1 \
-  --frame-rate 30 --aspect-ratio original --render-width 1920 \
+  --frame-rate "${FRAME_RATE:-30}" --aspect-ratio original --render-width "${RENDER_WIDTH:-1920}" \
   --mouse-look 1 --mouse-sensitivity 100 --mouse-invert-y 0 \
   --button-prompts playstation --system-language 20 --readbacks relaxed \
   --fps-cap 120 --performance-capture 1 --output-resolution automatic \
-  --sharpness 0 --anisotropy 1 --frames-queued 1 \
+  --sharpness "${IQ_SHARP:-0}" --anisotropy "${IQ_ANISO:-1}" --frames-queued 1 \
   --overlay-frametime 1 --overlay-gpu 0 --overlay-cpu 0 --overlay-memory 0 \
   --async-shaders 1 --background-warmup 0 --parallel-warmup 0 --speculative-readbacks 0 \
   --keyboard-bindings '{}' --controller-bindings '{}' \

@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Explicit player settings; availability describes the actual Order launch path."""
+import sys
+
+from launcher.order1886_lang import LANGUAGES
+from scripts.order1886_input import BUTTONS, UNBOUND
+
+PAGES = [
+    {"id": "home", "title": "Home"}, {"id": "graphics", "title": "Graphics"},
+    {"id": "performance", "title": "Performance"}, {"id": "controls", "title": "Controls"},
+    {"id": "game", "title": "Game & Content"}, {"id": "achievements", "title": "Achievements"},
+    {"id": "system", "title": "System"},
+]
+# The game's temporal inputs are mapped and a provider replaces its temporal resolve (#7, #10);
+# these choices wait for their own providers to be built and qualified.
+DLSS_LINUX = ("The Linux runtime does not load upscaler providers yet, so the game's own temporal "
+              "anti-aliasing stays (#11).")
+FSR4 = "The FSR 4 provider is not built into this package yet (#12)."
+FSR3_LINUX = ("The Linux runtime does not load upscaler providers yet, so the game's own temporal "
+              "anti-aliasing stays (#10).")
+NATIVE_ONLY = ("Every provider renders at the game's own size for now; lower render sizes need "
+               "render-target scaling (#3).")
+RENDERER = "This setting is not exposed by the validated Order launch profile yet; backend wiring and qualification are pending."
+PATCH = "No hash-verified recipe for this executable is available yet."
+FG = "Frame-generation presentation, synchronization and latency qualification are pending."
+FIELDS = []
+
+
+def field(key, label, page, kind, default, description, choices=None, reason="", **limits):
+    item = dict(key=key, label=label, page=page, kind=kind, default=default,
+                description=description, available=not bool(reason), reason=reason,
+                apply="next_launch", **limits)
+    if choices is not None:
+        item["choices"] = [
+            dict(value=value, label=title, available=not bool(why), reason=why)
+            for value, title, why in choices
+        ]
+    FIELDS.append(item)
+
+
+field("game_dir", "Game folder", "game", "directory", "", "Select your extracted game folder (any edition: CUSA00076, CUSA00035, CUSA00070, CUSA00100, CUSA00670 or CUSA00785). Original files remain unchanged.")
+field("runtime", "Runtime executable", "system", "file", "", "Leave empty to use the installation's verified Order runtime.")
+field("trophy_key", "Trophy key", "achievements", "secret", "",
+      "Optional: your own console's trophy key, 32 hexadecimal digits, as shadPS4 uses it. With it the launcher decrypts trophy names and descriptions from your game's own files; hidden trophies stay hidden until earned. The key stays in this installation's settings and is never sent anywhere.")
+field("performance_capture", "Record performance data", "system", "boolean", False,
+      "Save frame times and slow-frame diagnostics with each session's logs. Turn this off after recording the slow scene.")
+field("display_mode", "Display mode", "graphics", "select", "borderless", "Window mode is independent of framing and game timing.",
+      [("windowed", "Windowed", ""), ("borderless", "Borderless", ""), ("fullscreen", "Fullscreen", "")])
+field("aspect_ratio", "Framing", "graphics", "select", "original", "Original preserves cinematic framing. The 16:9 patch is executable-specific and experimental.",
+      [("original", "Original cinematic aspect", ""), ("16:9", "16:9 — experimental", "")])
+field("render_width", "Render resolution", "graphics", "select", 1920,
+      "The size the game itself renders at, with no upscaler: every screen-sized pass, from the G-buffer to tonemapping, runs at this width, and the height follows Framing (2.4:1 for Original, 16:9 for full screen). A prepared copy of the executable sets the size and grows the game's render-target memory to match; the original files stay unchanged. At any size other than the original Upscaling is set aside and the frame is presented 1:1, guest memory grows with larger sizes, and image quality, memory use and gameplay are experimental (docs/order1886-resolution.md).",
+      [(1280, "1280 wide, Steam Deck — experimental", ""), (1920, "Original (1920 wide)", ""),
+       (2560, "2560 wide — experimental", ""),
+       (3840, "3840 wide, native 4K — experimental", ""), (0, "Custom width — experimental", "")])
+field("custom_render_width", "Custom render width", "graphics", "number", 3200,
+      "Used when Render resolution is Custom: a multiple of 16 from 1280 to 4880 (4192 with 16:9 framing).",
+      minimum=1280, maximum=4880, multiple=16)
+field("presentation_filter", "Upscaling", "graphics", "select", "fsr1", "Choose Linear / no FSR for the original-resolution path. AMD FSR 3.1 or NVIDIA DLAA replaces the game's own temporal anti-aliasing at the game's render size, then FSR 1 scales the result to the output. DLAA needs an NVIDIA GeForce RTX GPU; on any other GPU the game's own anti-aliasing stays and the session log says why. Presentation scaling does not establish native internal resolution: the scene renders at the size the game chooses, and larger output is not native 4K (docs/order1886-resolution.md).",
+      [("linear", "Linear / no FSR", ""), ("fsr1", "FSR 1", ""),
+       ("fsr3", "AMD FSR 3.1 (native AA) + FSR 1", "" if sys.platform == "win32" else FSR3_LINUX),
+       ("dlss", "NVIDIA DLAA (DLSS at native size) + FSR 1", "" if sys.platform == "win32" else DLSS_LINUX),
+       ("fsr4", "AMD FSR 4", FSR4),
+       # XeSS has no identifier in the runtime's upscaler names yet; the runtime's "fsr411" has no
+       # launcher label either, so both sides are honest about the mismatch.
+       ("xess", "Intel XeSS", "The runtime has no XeSS identifier yet, so even a qualified temporal "
+        "renderer could not select it (#13).")])
+field("vsync", "VSync", "graphics", "boolean", True, "Synchronize presentation with the display.")
+field("output_resolution", "Output resolution", "graphics", "select", "automatic",
+      "Size of the presented image before it is fitted to the window. The game still renders at its own size, so a larger output is upscaled by the Upscaling filter, not native 4K; a smaller one costs less and is stretched to the window. Output dimensions and game-rendered dimensions are reported separately.",
+      [("automatic", "Match the window", ""), ("1280x720", "1280 × 720 output", ""),
+       ("1920x1080", "1920 × 1080 output", ""), ("2560x1440", "2560 × 1440 output", ""),
+       ("3840x2160", "3840 × 2160 output (upscaled, not native 4K)", "")])
+field("upscale_preset", "Upscaler quality", "graphics", "select", "native", "Quality presets render the scene below the output size and let the temporal provider reconstruct it.",
+      [(x, x.title(), NATIVE_ONLY) for x in ("native", "quality", "balanced", "performance")], reason=NATIVE_ONLY)
+field("sharpness", "Sharpening", "graphics", "number", 0,
+      "RCAS sharpening strength in percent; 0 turns it off. It runs with FSR 1 upscaling, or when the output matches the game's size; with Linear upscaling to a larger output it has no pass to run in.",
+      minimum=0, maximum=100)
+field("anisotropy", "Anisotropic filtering", "graphics", "select", 1,
+      "Raises filtering to at least this level on filtered, mipmapped textures; depth and point-sampled textures keep the game's own sampling. Applies on next launch; visual qualification is pending.",
+      [(x, "Game default" if x == 1 else str(x) + "×", "") for x in (1, 2, 4, 8, 16)])
+# Each switch edits the prepared copy of the executable (scripts/order1886_post_effects.py) so the
+# game takes its own path for a lens without that effect. There is no model-detail switch: the
+# only level-of-detail control found in the executable is a frame-capture flag with no located
+# reader, so offering one would be a placebo (#16).
+POST_EFFECT = (" On is the original image. Off zeroes the effect's strength in a hash-checked prepared "
+               "copy of the executable, applied on next launch; the original game files stay unchanged "
+               "and gameplay with the effect off is unqualified.")
+for key, label, detail in (
+        ("film_grain", "Film grain", "The animated grain noise laid over the final image."),
+        ("motion_blur", "Motion blur", "The camera and object motion blur of the full-screen effects pass."),
+        ("depth_of_field", "Depth of field", "The out-of-focus blur of cutscenes and aiming; distance fog blur is kept."),
+        ("chromatic_aberration", "Chromatic aberration", "The colour fringing toward the edges of the lens.")):
+    field(key, label, "graphics", "boolean", True, detail + POST_EFFECT)
+field("frame_rate", "Game frame rate", "performance", "select", 30,
+      "30 FPS is native. 60, 90 and Unlocked are experimental: the game clock follows measured time, but Chapter 6/9 QTE checks remain required, and gameplay timing above 60 FPS is still unmeasured: at 60 FPS the tested courtyard runs at about 53 FPS on an RTX 3070. Unlocked runs as fast as the presentation frame cap allows; on a 60 Hz display, VSync holds every rate at 60. While playing, F10 cycles the rate live: 60, 90, 120, back to 30.",
+      [(30, "30 FPS — native", ""), (60, "60 FPS — experimental", ""),
+       (90, "90 FPS — experimental", ""), (0, "Unlocked — experimental", "")])
+field("in_game_menu", "In-game settings menu", "performance", "boolean", False, "Off by default. The menu, its tabs and the settings it changes while the game runs are unqualified for this title: input capture, focus and stability have not been verified in gameplay, so enable it only to help test it. Insert or R3+R2 toggles it when enabled.")
+field("fps_cap", "Presentation frame cap", "performance", "number", 120, "Limits how often the runtime presents (#14). At 30, 60 or 90 FPS the game frame rate still wins while it is lower, so the default of 120 never changes their pacing and lowering it throttles presentation only. With Unlocked this cap is the frame rate. The game clock follows measured time either way, so this is not a simulation-speed control.", minimum=30, maximum=240)
+field("frame_generation", "Frame generation", "performance", "select", "off", "Generated frames do not increase simulation rate. All three providers remain in the gold plan.",
+      [("off", "Off", ""), ("fsr", "AMD FSR Frame Generation", FG),
+       ("dlss", "NVIDIA DLSS Frame Generation", FG + " Requires supported NVIDIA hardware."),
+       ("xess", "Intel XeSS Frame Generation", FG + " Requires the Windows D3D12 presentation bridge.")], reason=FG)
+field("show_fps", "Performance overlay", "performance", "boolean", True, "Show the runtime performance overlay.")
+field("htile_unqualified", "HTILE metadata adaptation (unqualified)", "performance", "boolean", False,
+      "Off by default. The adapted HTILE metadata read path has no matched gameplay, visual or frame-cost qualification yet (#5), so leave it off unless you are helping to measure it. Turning it on lets buffer reads take the tracked HTILE word instead.")
+field("synchronous_recording", "Synchronous command recording (unqualified)", "performance", "boolean", False,
+      "Off by default and unqualified for performance, stability and visuals. The runtime normally records Vulkan commands on its own recording thread and hands them over; turning this on records each command on the thread that submits it, so no work moves between threads. It does not change what the game draws. A runtime honours it only when its build declares the live switch file.")
+field("texture_update_locking", "Locked texture update checks (unqualified)", "performance", "boolean", False,
+      "Off by default and unqualified for performance, stability and visuals. Before an upload the runtime checks a clean image's flags without taking the mutex it shares with the guest fault handlers; turning this on takes that mutex for every check. Uploads and image contents are otherwise unchanged, and the extra locking costs GPU-thread time. It is here to isolate a suspected race, not to change the picture. A runtime honours it only when its build declares the live switch file.")
+field("readbacks", "GPU readback policy", "performance", "select", "relaxed",
+      "Relaxed keeps the existing behavior. Selective synchronizes CPU reads of small GPU output buffers; precise tracks all GPU-written buffers. Both can add waits and require gameplay/performance qualification.",
+      [("relaxed", "Relaxed (existing baseline)", ""), ("selective", "Selective — experimental", ""),
+       ("precise", "Precise — experimental", ""), ("disabled", "Disabled", "Required buffer readbacks cannot be disabled in the Order profile.")])
+for key, label, default in (("overlay_frametime", "Overlay: frame time", True), ("overlay_gpu", "Overlay: GPU", False),
+                            ("overlay_cpu", "Overlay: CPU", False), ("overlay_memory", "Overlay: RAM / VRAM", False)):
+    field(key, label, "performance", "boolean", default, "Shown in the performance overlay when it is on.")
+field("frames_queued", "Queued frames", "performance", "select", 1,
+      "How many frames the GPU command thread may run ahead of the GPU. 1 is the paced baseline; 2 can raise throughput at the cost of latency; Unbounded removes the wait and can make frame delivery bursty.",
+      [(1, "1 — baseline", ""), (2, "2 (unqualified)", ""), (0, "Unbounded (unqualified)", "")])
+field("async_shaders", "Asynchronous shaders", "performance", "boolean", True,
+      "Compile new shaders and pipelines off the GPU thread. A draw whose pipeline is still compiling is skipped for that frame, so a first-time effect can be missing for a moment instead of the game stopping. Compute dispatches and tessellated draws still compile in place. Turn it off to wait for every compile.")
+UNQUALIFIED = "Off by default: the correctness baseline. Turning it on is unqualified for stability and visuals; use it to help measure the path."
+for key, label, detail in (
+        ("background_warmup", "Background pipeline warmup (unqualified)",
+         "Load cached pipelines while the game runs instead of on a loading screen before the first frame."),
+        ("parallel_warmup", "Parallel pipeline warmup (unqualified)",
+         "Build cached pipelines on several CPU threads during warmup."),
+        ("speculative_readbacks", "Deferred image readbacks (unqualified)",
+         "Copy GPU-written images back to guest memory later, in batches, instead of waiting at each CPU access.")):
+    field(key, label, "performance", "boolean", False, detail + " " + UNQUALIFIED)
+field("mouse_look", "Mouse camera", "controls", "boolean", True, "Map mouse movement to the game camera; release capture when focus is lost.")
+field("mouse_sensitivity", "Mouse sensitivity", "controls", "number", 100, "Camera sensitivity in percent.", minimum=10, maximum=500)
+field("mouse_invert_y", "Invert vertical camera", "controls", "boolean", False, "Invert vertical mouse movement.")
+field("button_prompts", "Button prompts", "controls", "select", "playstation",
+      "The buttons the game shows in prompts, menus and quick-time events. Keyboard and mouse is built from your own game files on the first launch with it (up to a minute) and leaves the original files unchanged. Its key caps show the keys of your current keyboard mapping (Controls page): a key you change shows in the prompts on the next launch.",
+      [("playstation", "PlayStation (original)", ""), ("keyboard", "Keyboard and mouse", "")])
+field("vibration", "Controller vibration", "controls", "boolean", True, "Independent vibration configuration is pending runtime validation.", reason=RENDERER)
+for kind, label in (("keyboard", "Keyboard buttons"), ("controller", "Controller buttons")):
+    field(kind + "_bindings", label, "controls", "bindings", {},
+          "Choose the host input for each PS4 digital button. Default restores the original source. Shared inputs press all assigned buttons; keyboard stick keys, mouse buttons and overlay shortcuts stay active. Physical sticks, analog triggers and real touch input are unchanged. Applies on next launch.",
+          choices=[(UNBOUND, "No digital source", "Select a matching native runtime to remove a digital binding.")],
+          input_kind=kind, buttons=[{"id": key, "label": title, "default": []} for key, title in BUTTONS.items()])
+field("input_remapping", "Stick axes and analog trigger remapping", "controls", "text", "", "Keyboard stick axes, physical analog triggers and real touch input are not independently remappable yet (#4).", reason=RENDERER)
+field("ui_language", "Launcher language", "system", "select", "en", "Apply the launcher catalog immediately. Game language changes take effect on its next launch when assets are installed.",
+      [(key, title, "") for key, title in LANGUAGES.items()])
+field("game_text_language", "Game text language", "game", "select", "follow", "Independent text selection remains tracked in #21.",
+      [("follow", "Follow launcher language", "")] + [(key, title, PATCH) for key, title in LANGUAGES.items()], reason=PATCH)
+GAME_LANGUAGES = [(1, "English (United States)"), (18, "English (United Kingdom)"), (2, "Français"),
+                  (22, "Français (Canada)"), (4, "Deutsch"), (5, "Italiano"), (3, "Español (España)"),
+                  (20, "Español (Latinoamérica)"), (7, "Português (Portugal)"), (17, "Português (Brasil)"),
+                  (8, "Русский"), (16, "Polski"), (6, "Nederlands"), (19, "Türkçe"), (21, "العربية"),
+                  (12, "Suomi"), (13, "Svenska"), (14, "Dansk"), (15, "Norsk"), (23, "Čeština"),
+                  (24, "Magyar"), (25, "Ελληνικά"), (0, "日本語"), (9, "한국어"), (11, "简体中文"), (10, "繁體中文")]
+field("game_language", "Game language", "game", "select", "follow",
+      "The language of the game's menus, subtitles and voices. The game uses one language for all of them; "
+      "it has no separate voice setting. Applies on the next launch. If your edition has no assets for the "
+      "chosen language, the game uses its default language instead.",
+      [("follow", "Follow launcher language", "")] + [(code, name, "") for code, name in GAME_LANGUAGES])
+field("game_voice_language", "Game voice language", "game", "select", "follow", "Independent voice selection requires installed language assets (#21).",
+      [("follow", "Follow launcher language", "")] + [(key, title, PATCH) for key, title in LANGUAGES.items()], reason=PATCH)
+field("selected_patches", "Catalogued patches", "game", "patches", [], "Recipes that edit the prepared image are applied on the next preparation, and each one must match this build`s title id, APP_VER, VERSION, image hashes and expected bytes or the preparation refuses it. The 60 FPS and 16:9 recipes are configured by the game frame rate and framing settings instead, so they are not selectable here.")
+field("mods_dir", "Mods folder", "game", "directory", "", "Mount loose-file overlays without changing original game files.")
+field("mods_enabled", "Enable mods", "game", "boolean", False, "Only enabled folders in the saved order are mounted.")
+field("mod_order", "Enabled mod order", "game", "order", [], "One folder name per line. Later enabled mods take priority; newly discovered mods remain disabled.")
+for key, label in (("infinite_health", "Infinite health"), ("infinite_ammo", "Infinite ammunition"),
+                   ("skip_reload", "Skip reload")):
+    field(key, label, "game", "boolean", False, "Cheats require version-verified recipes and gameplay acceptance (#15).", reason=PATCH)
+field("automatic_updates", "Check for updates on start", "system", "boolean", False,
+      "Check the selected channel once when the launcher starts and show a notice. Nothing is downloaded or installed without a click.")
+field("update_channel", "Update channel", "system", "select", "preview",
+      "Preview follows every published Go preview, which is the only channel that carries a launcher package today. Stable stays quiet until a release without a preview suffix exists.",
+      [("preview", "Preview — every published Go preview", ""),
+       ("stable", "Stable — released builds only", "")])
+

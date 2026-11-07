@@ -1,0 +1,989 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""The Order: 1886 launch path using the repository's native PS4 loader.
+
+Prepared images contain PS4 code; optional timing changes are hash-bound derived patches.
+State and configuration belong to this title.
+An import audit or a successful process exit is never treated as gameplay proof.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import functools
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parent
+INSTALL_ROOT = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else ROOT
+SCRIPTS = ROOT / 'scripts'
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+import prepare
+import link_modules
+import save_backup
+import order1886_frame_rate as timing
+import order1886_display as display
+import order1886_resolution as resolution
+import order1886_post_effects as post_effects
+import order1886_mods as mods
+import order1886_input as inputs
+import order1886_patches as patch_catalogue
+import order1886_editions as editions
+import order1886_prompts as prompts
+
+TITLE_ID = editions.VERIFIED_TITLE_ID  # the default folder name; every edition is accepted
+RUNTIME_ABI = 'order1886-native-1'
+SHADER_CACHE_ABI = 'native-ps4-v1'
+# OrbisSystemParamLanguage: pt is Brazilian Portuguese; zh is Simplified Chinese.
+SYSTEM_LANGUAGES = {'en': 1, 'ru': 8, 'ar': 21, 'es': 3, 'pt': 17, 'fr': 2,
+                    'de': 4, 'it': 5, 'pl': 16, 'tr': 19, 'zh': 11, 'ja': 0, 'ko': 9}
+REQUIRED_FILES = ('eboot.bin', 'sce_sys/param.sfo', 'sce_module/libc.prx', 'sce_module/libSceFios2.prx')
+
+
+def emit_status(message, *, error=False, fallback=None):
+    """A detached console must not replace the runtime's result or its diagnostics."""
+    primary, secondary = ('stderr', 'stdout') if error else ('stdout', 'stderr')
+    failed = False
+    for name in (primary, secondary):
+        stream = getattr(sys, name)
+        if stream is None:
+            failed = True
+            continue
+        try:
+            print(message, file=stream, flush=True)
+            if not failed:
+                return
+            break
+        except (OSError, ValueError):
+            # Retire the dead stream so Python's final flush cannot change exit 0/23 to 120.
+            failed = True
+            for other in ('stdout', 'stderr'):
+                if getattr(sys, other) is stream:
+                    setattr(sys, other, None)
+            if hasattr(stream, 'close'):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+    if failed and fallback is not None:
+        if hasattr(fallback, 'write'):
+            fallback.write(message + '\n')
+            fallback.flush()
+        else:
+            path = Path(fallback)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open('a', encoding='utf-8') as log:
+                log.write(message + '\n')
+
+
+def default_game_dir():
+    relative = Path('ShadPs4Plus-PkgExtractor-1.1-windows') / TITLE_ID
+    bases = (INSTALL_ROOT, INSTALL_ROOT.parent, INSTALL_ROOT.parent.parent)
+    for base in bases:
+        if (base / relative / 'eboot.bin').is_file():
+            return base / relative
+    # Without the launcher window (Linux without WebKitGTK, #114) nothing picks a folder, so a
+    # game folder of any edition and any name in or beside the installation is used.
+    for base in bases[:2]:
+        if base == base.parent:  # never scan a drive or filesystem root
+            break
+        try:
+            folders = sorted(base.iterdir())
+        except OSError:
+            continue
+        for folder in folders:
+            try:
+                found = (folder / 'eboot.bin').is_file()
+            except OSError:  # a folder this user may not read
+                continue
+            if found and editions.supported((prepare.read_sfo(folder / 'sce_sys/param.sfo') or {}).get('TITLE_ID')):
+                return folder
+    return INSTALL_ROOT / relative
+
+
+def inspect_game(game):
+    game = Path(game).expanduser().resolve()
+    for name in REQUIRED_FILES:
+        file = game / name
+        if not file.is_file() or file.stat().st_size == 0:
+            raise ValueError(f'Missing or empty game file: {file}')
+    metadata = prepare.load_sfo(game / 'sce_sys/param.sfo')
+    if not editions.supported(metadata.get('TITLE_ID')):
+        raise ValueError(f'Expected The Order: 1886 ({", ".join(editions.TITLE_IDS)}), '
+                         f'found {metadata.get("TITLE_ID", "unknown title")}')
+    if not (game / '_data').is_dir() or not (game / 'archivemap.bin').is_file():
+        raise ValueError('The Order game content is incomplete: _data and archivemap.bin are required.')
+    return metadata
+
+
+def find_runtime_path(explicit=None):
+    """Locate the selected executable; identity verification belongs to find_runtime."""
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f'Runtime executable not found: {path}')
+        return path
+    name = 'order1886-runtime.exe' if os.name == 'nt' else 'order1886-runtime'
+    bases = (INSTALL_ROOT,) if getattr(sys, 'frozen', False) else tuple(dict.fromkeys((INSTALL_ROOT, ROOT)))
+    candidates = [base / folder / name for base in bases
+                  for folder in ('bin', 'out')]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def find_runtime(explicit=None):
+    path = find_runtime_path(explicit)
+    if path is None:
+        return None
+    build = runtime_identity(path)['build']
+    if not build or build.get('game_profile') != 'order1886' or build.get('runtime_abi') != RUNTIME_ABI:
+        raise ValueError(f'{path.name} is not a verified Order runtime: {runtime_rejection(path, build)} '
+                         "Clear System > Runtime executable to use the installation's runtime.")
+    return path
+
+
+def runtime_rejection(path, build):
+    """Why find_runtime refused path, in words a player can act on."""
+    if path.stem.lower().startswith('order1886-worker'):
+        return "it is the launcher's helper program, not the game runtime (order1886-runtime.exe)."
+    sidecar = path.with_name('runtime-build.json')
+    if not sidecar.is_file():
+        return f'{sidecar.name} is missing beside it; the runtime and its build record must stay together.'
+    if not build:
+        return f'it does not match the {sidecar.name} beside it (files from different builds or a modified file); reinstall the package.'
+    return f'it was built for {build.get("game_profile")!r} / {build.get("runtime_abi")!r}, not this launcher ({RUNTIME_ABI}).'
+
+
+def sha256(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+@functools.lru_cache(maxsize=4)
+def _runtime_sha256(path, size, mtime_ns, file_id):
+    return sha256(path)
+
+
+def runtime_identity(runtime):
+    runtime = Path(runtime).resolve()
+    # The launcher polls state.get, which identifies the 129 MB runtime each time;
+    # rehash only when the file is replaced or rewritten.
+    status = runtime.stat()
+    digest = _runtime_sha256(str(runtime), status.st_size, status.st_mtime_ns, status.st_ino)
+    try:
+        build = json.loads(runtime.with_name('runtime-build.json').read_text(encoding='utf-8'))
+        if not isinstance(build, dict) or build.get('runtime_sha256') != digest:
+            build = None
+    except (OSError, ValueError):
+        build = None
+    return {'runtime': str(runtime), 'runtime_sha256': digest, 'build': build}
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    temporary.replace(path)
+
+
+def prepare_game(game, out, frame_rate=30, aspect_ratio='original', patches=(), disabled_effects=(),
+                 render_width=resolution.NATIVE_WIDTH):
+    game, out = Path(game).resolve(), Path(out).resolve()
+    metadata = inspect_game(game)
+    # Prevent accidental writes to the extracted game, even with custom CLI arguments.
+    if out == game or game in out.parents:
+        raise ValueError('Prepared images must be stored outside the game folder.')
+    # Refuse an unusable selection before any work: a recipe is bound to this build.
+    selected_patches = patch_catalogue.select(patches, metadata)
+    profile = timing.validate_source(game / 'eboot.bin', frame_rate, metadata)
+    display_profile = display.validate_source(game / 'eboot.bin', aspect_ratio, metadata)
+    effects_profile = post_effects.validate_source(game / 'eboot.bin', disabled_effects, metadata)
+    resolution_profile = resolution.validate_source(game / 'eboot.bin', render_width, metadata, aspect_ratio)
+    fingerprint = {name: sha256(game / name) for name in REQUIRED_FILES}
+    for name in ('prepare.py', 'link_modules.py', 'link_libc.py', 'order1886_frame_rate.py', 'order1886_display.py',
+                 'order1886_post_effects.py', 'order1886_editions.py', 'order1886_resolution.py'):
+        fingerprint['tool/' + name] = sha256(SCRIPTS / name)
+    fingerprint.update(frame_rate=profile['engine_fps'], host_fps_limit=profile['host_fps_limit'],
+                       frame_rate_recipe_sha256=profile['recipe_sha256'], runtime_abi=RUNTIME_ABI,
+                       preparation_schema=3, aspect_ratio=aspect_ratio,
+                       display_recipe_sha256=display_profile['recipe_sha256'],
+                       disabled_effects=effects_profile['disabled'],
+                       post_effects_recipe_sha256=effects_profile['recipe_sha256'],
+                       resolution_recipe_sha256=resolution_profile['recipe_sha256'],
+                       patches=patch_catalogue.patch_fingerprint(selected_patches))
+    manifest = out / 'prepared.json'
+    try:
+        previous = json.loads(manifest.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        previous = {}
+    image = out / 'boot-linked.bin'
+    if (previous.get('inputs') == fingerprint and previous.get('game') == str(game)
+            and image.is_file() and previous.get('image_sha256') == sha256(image)
+            and (frame_rate == 30 or previous.get('frame_rate_profile', {}).get('applied') is True)
+            and (aspect_ratio == 'original' or previous.get('display_profile', {}).get('applied') is True)
+            and (not effects_profile['disabled'] or previous.get('post_effects_profile', {}).get('applied') is True)
+            and (render_width == resolution.NATIVE_WIDTH
+                 or previous.get('resolution_profile', {}).get('applied') is True)):
+        emit_status('Prepared image verified; reusing cached image.', fallback=out.parent / 'logs/backend.log')
+        return previous
+    out.mkdir(parents=True, exist_ok=True)
+    # Invalidate before writing, so interrupted preparation cannot reuse a partial image.
+    manifest.unlink(missing_ok=True)
+    prepare.prepare(game, out)
+    profile = timing.apply_prepared(out / 'boot.bin', profile)
+    display_profile = display.apply_prepared(out / 'boot.bin', display_profile)
+    effects_profile = post_effects.apply_prepared(out / 'boot.bin', effects_profile)
+    resolution_profile = resolution.apply_prepared(out / 'boot.bin', resolution_profile)
+    # Catalogued recipes edit the derived image, never the guest executable; the fingerprint
+    # already binds that image to the eboot.bin hash it was produced from.
+    applied_patches = patch_catalogue.apply_to_prepared(out / 'boot.bin', selected_patches, metadata)
+    link_modules.link(game, out)
+    result = {'game': str(game), 'title_id': metadata['TITLE_ID'], 'inputs': fingerprint,
+              'frame_rate_profile': profile,
+              'display_profile': display_profile,
+              'post_effects_profile': effects_profile,
+              'resolution_profile': resolution_profile,
+              'catalogue_patches': applied_patches,
+              'image_sha256': sha256(image), 'status': 'prepared; gameplay unverified'}
+    write_json(manifest, result)
+    return result
+
+
+def validate_readback_policy(runtime, policy):
+    if policy not in ('relaxed', 'selective', 'precise'):
+        raise ValueError('GPU readback policy must be relaxed, selective or precise')
+    if policy in ('selective', 'precise'):
+        build = runtime_identity(runtime)['build'] or {}
+        policies = build.get('readback_policies', [])
+        if not isinstance(policies, list) or policy not in policies:
+            raise ValueError(f'{policy.title()} readbacks require a matching native runtime build declaring {policy} support. Rebuild or select a newer runtime.')
+
+
+def validate_performance_capture(runtime, enabled):
+    if type(enabled) not in (bool, int) or enabled not in (False, True):
+        raise ValueError('Performance recording must be on or off')
+    if enabled and (runtime_identity(runtime).get('build') or {}).get('performance_capture') is not True:
+        raise ValueError('Performance recording requires a matching native runtime declaring capture support. Rebuild or select a newer runtime.')
+
+
+def validate_htile_control(runtime, enabled):
+    if type(enabled) not in (bool, int) or enabled not in (False, True):
+        raise ValueError('HTILE control must be on or off')
+    if enabled and (runtime_identity(runtime).get('build') or {}).get('htile_control') is not True:
+        raise ValueError('HTILE control requires a matching native runtime declaring it. Rebuild or select a newer runtime.')
+
+
+# Live runtime switches. The runtime re-reads the decimal mask in the file named by
+# ORDER1886_TOGGLE_FILE every 250 ms (src/runtime_memory.c) and switches off the
+# optimization each set bit names (gpu/shim/ps4_toggles.h). Only bits the Order renderer
+# still acts on are offered here: SceneHalfRes and the TAA bits are declared in that
+# header but read nowhere, and SceneMipBias only scales TemporalUpscaler::SceneMipBias(),
+# which the Order baseline returns as 0 (order1886_render_baseline.h). Delivering those
+# would offer a control nothing honours.
+EFFECT_TOGGLES = {
+    # Player setting: (mask bit the runtime reads, label used in refusals). The enum mixes
+    # the two spellings, so take the values from it rather than from a bit index:
+    # ThreadedRecording is 16 (1 << 4) and UpdateImageFastPath is 1 << 30.
+    'synchronous_recording': (1 << 4, 'Synchronous command recording'),  # Ps4Toggle::ThreadedRecording
+    'texture_update_locking': (1 << 30, 'Locked texture update checks'),  # Ps4Toggle::UpdateImageFastPath
+}
+EFFECT_TOGGLE_FILE = 'effect-toggles.txt'
+
+
+def validate_effect_toggle_support(runtime):
+    """The selected runtime must declare that it reads the live toggle file it is given."""
+    if (runtime_identity(runtime).get('build') or {}).get('effect_toggles') is not True:
+        raise ValueError('Effect toggles require a matching native runtime declaring the live '
+                         'toggle file. Rebuild or select a newer runtime.')
+
+
+def validate_effect_toggles(runtime, toggles):
+    """Refuse anything but real booleans, and refuse enabling on an undeclaring runtime."""
+    if not isinstance(toggles, dict) or set(toggles) - set(EFFECT_TOGGLES):
+        raise ValueError('Unknown effect toggle')
+    mask = 0
+    for name, (bit, label) in EFFECT_TOGGLES.items():
+        value = toggles.get(name, False)
+        if type(value) is not bool:
+            raise ValueError(f'{label} must be on or off')
+        if value:
+            mask |= bit
+    if mask:
+        validate_effect_toggle_support(runtime)
+    return mask
+
+
+def effect_toggle_mask(runtime, settings):
+    """Resolve the requested switches to the runtime's own mask."""
+    return validate_effect_toggles(runtime, {name: settings.get(name, False)
+                                             for name in EFFECT_TOGGLES})
+
+
+def effect_toggle_environment(user, mask):
+    """Deliver the mask through the file the runtime already re-reads, and nothing else."""
+    path = Path(user) / EFFECT_TOGGLE_FILE
+    if not mask:
+        # An all-off launch is the existing launch path: no file, so no watcher starts.
+        path.unlink(missing_ok=True)
+        return {}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'{mask}\n', encoding='utf-8')
+    return {'ORDER1886_TOGGLE_FILE': str(path)}
+
+
+def validate_in_game_menu(enabled):
+    """The in-game menu stays opt-in: it is unqualified for gameplay on this title."""
+    if type(enabled) is not bool:
+        raise ValueError('The in-game menu must be on or off')
+    return enabled
+
+
+def validate_fps_cap(settings):
+    """Presentation cap only: it can throttle the present thread, never the engine."""
+    value = settings.get('fps_cap', 120)
+    if type(value) is not int or not 30 <= value <= 240:
+        raise ValueError('Presentation frame cap must be a whole number from 30 to 240')
+    return value
+
+
+def timing_profile(settings):
+    """Resolve engine rate, presentation cadence, host cap and VSync for diagnostics."""
+    engine = timing.validate_frame_rate(settings.get('frame_rate', 30))
+    cap = validate_fps_cap(settings)
+    # The cap only ever throttles: the engine rate wins while it is the lower value,
+    # so the shipped default of 120 leaves pacing exactly as it was.
+    limit = cap if engine == 0 else min(engine, cap)
+    return {'engine_fps': engine, 'fps_cap': cap, 'fps_limit': limit,
+            'vblank_hz': 60, 'vsync': bool(settings.get('vsync', True))}
+
+
+# Diagnostic switches that change no game behaviour; everything else ORDER1886_* is
+# set from the player's settings only.
+DIAGNOSTIC_ENVIRONMENT = frozenset({'ORDER1886_DIAG_RESOURCE_SHARPS', 'ORDER1886_FATAL_DUMP',
+                                    'ORDER1886_GPU_LOG', 'ORDER1886_PERF_DIAG'})
+
+
+def runtime_process_environment(runtime, inherited=None):
+    runtime = Path(runtime).resolve()
+    source = os.environ if inherited is None else inherited
+    env = {k: v for k, v in source.items()
+           if not k.upper().startswith('ORDER1886_') or k in DIAGNOSTIC_ENVIRONMENT}
+    env['PATH'] = str(runtime.parent) + os.pathsep + env.get('PATH', '')
+    if os.name == 'nt' and not getattr(sys, 'frozen', False) and ROOT / 'out' in runtime.parents:
+        dependencies = Path(source.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
+        if dependencies.is_dir():
+            env['PATH'] = str(runtime.parent) + os.pathsep + str(dependencies) + os.pathsep + source.get('PATH', '')
+    return env
+
+
+def input_catalog(runtime, inherited=None):
+    if (runtime_identity(runtime).get('build') or {}).get('input_remapping') is not True:
+        raise ValueError('Custom bindings require a matching native runtime declaring input remapping support.')
+    return inputs.read_catalog(runtime, runtime_process_environment(runtime, inherited))
+
+
+def validate_input_settings(runtime, settings, inherited=None):
+    maps = {kind: settings.get(kind + '_bindings', {}) for kind in ('keyboard', 'controller')}
+    for kind, mapping in maps.items():
+        inputs.validate(mapping, kind)
+    if any(maps.values()) and runtime is None:
+        raise ValueError('Select a verified native runtime before using custom bindings.')
+    catalog = input_catalog(runtime, inherited) if any(maps.values()) else None
+    return {('ORDER1886_KEY_MAP' if kind == 'keyboard' else 'ORDER1886_PAD_MAP'):
+            inputs.encode(mapping, kind, catalog) for kind, mapping in maps.items()}
+
+
+def runtime_environment(runtime, user, settings=None, inherited=None):
+    runtime, user = Path(runtime).resolve(), Path(user).resolve()
+    settings = settings or {}
+    readbacks = settings.get('readbacks', 'relaxed')
+    validate_readback_policy(runtime, readbacks)
+    capture = settings.get('performance_capture', False)
+    validate_performance_capture(runtime, capture)
+    # The CLI flag is how the launcher setting reaches the backend; either spelling works.
+    # An explicit setting wins, so an invalid value still raises; the CLI flag is the
+    # fallback spelling the launcher uses.
+    htile = settings['htile_unqualified'] if 'htile_unqualified' in settings \
+        else settings.get('htile', False)
+    validate_htile_control(runtime, htile)
+    effect_mask = effect_toggle_mask(runtime, settings)
+    # --in-game-menu uses the same dest as the launcher setting, so either source works.
+    in_game_menu = validate_in_game_menu(settings.get('in_game_menu', False))
+    system_language = settings.get('system_language', 1)
+    if type(system_language) is not int or not 0 <= system_language <= 29:
+        raise ValueError('System language must be an integer from 0 to 29')
+    profile = timing_profile(settings)
+    graphics = graphics_settings(settings)
+    env = runtime_process_environment(runtime, inherited)
+    env.update({
+        'ORDER1886_CONFIG': str(user / 'runtime.ini'), 'ORDER1886_USER_DIR': str(user),
+        'ORDER1886_GPU_USER_DIR': str(user / 'gpu' / SHADER_CACHE_ABI), 'ORDER1886_GAME_PROFILE': 'order1886',
+        'ORDER1886_LANGUAGE': str(system_language),
+        'ORDER1886_READBACKS': str({'relaxed': 1, 'selective': 3, 'precise': 2}[readbacks]),
+        # Off by default: the HTILE adaptation is unqualified for gameplay, visuals
+        # and frame cost, so a player can keep it out of the launch path.
+        'ORDER1886_HTILE': '1' if htile else '0',
+        # Reuse validated cached pipelines before playback rather than compiling during it,
+        # unless the player opted in to warming them up while the game runs.
+        'ORDER1886_PIPELINE_BINARIES': '1',
+        'ORDER1886_BACKGROUND_WARMUP': '1' if graphics['background_warmup'] else '0',
+        'ORDER1886_PARALLEL_WARMUP': '1' if graphics['parallel_warmup'] else '0',
+        'ORDER1886_DEFERRED_READBACK': '1' if graphics['speculative_readbacks'] else '0',
+        # Keep unverified speculative SRT work off the normal Order launch path.
+        'ORDER1886_PREP_WORKERS': '0',
+        # Opt-in: the in-game menu and the settings it edits live are unqualified.
+        'ORDER1886_SETTINGS_MENU': '1' if in_game_menu else '0',
+        'ORDER1886_STREAM_MEMORY': 'cached', 'PYTHONIOENCODING': 'utf-8',
+    })
+    render_width = resolution.validate_width(settings.get('render_width', resolution.NATIVE_WIDTH))
+    if render_width != resolution.NATIVE_WIDTH:
+        # The render-target stack and the GPU heap that holds it grow with the frame.
+        env['ORDER1886_DMEM_MB'] = str(resolution.dmem_mb(render_width, settings.get('aspect_ratio', 'original')))
+    if profile['fps_limit'] is not None:
+        env['ORDER1886_FPS_LIMIT'] = str(profile['fps_limit'])
+    env['ORDER1886_VBLANK_HZ'] = str(profile['vblank_hz'])
+    # Off by default: the runtime keeps running the paths it already runs, and an
+    # all-off launch sets no toggle file at all.
+    env.update(effect_toggle_environment(user, effect_mask))
+    env.update(validate_input_settings(runtime, settings, inherited))
+    icon = user / 'window_icon.bmp'
+    if icon.is_file():
+        env['ORDER1886_WINDOW_ICON'] = str(icon)
+    if capture:
+        env['ORDER1886_FRAME_STATS'] = '1'
+        env['ORDER1886_FRAME_TRACE'] = str(user / 'logs' / f'performance-{uuid.uuid4().hex}.csv')
+    return env
+
+
+# Launcher "Upscaling" choices the backend honours: Linear or FSR 1 presentation, or a temporal
+# provider (FSR 3.1, DLSS) in place of the game's temporal resolve followed by FSR 1 presentation.
+TEMPORAL_PROVIDERS = ('fsr3', 'dlss')
+PRESENTATION_FILTERS = ('linear', 'fsr1', 'fsr3', 'dlss')
+
+
+# Keys the in-game menu can change that also exist as launcher settings. The runtime writes
+# them into the same runtime.ini the launcher generates, so a menu change would otherwise be
+# overwritten by the next Play without anyone noticing.
+MENU_SETTING_MAP = {
+    'display_mode': ('display_mode', ('windowed', 'borderless', 'fullscreen')),
+    'vsync': ('vsync', None),
+    'show_fps': ('show_fps', None),
+    'presentation_filter': ('presentation_filter', PRESENTATION_FILTERS),
+    'mouse_look': ('mouse_look', None),
+    'mouse_invert_y': ('mouse_invert_y', None),
+    'mouse_sensitivity': ('mouse_sensitivity', None),
+}
+
+
+def menu_settings_import(state, values):
+    """Settings the in-game menu changed since the launcher last saved, or an empty dict.
+
+    The runtime writes the menu's choices into runtime.ini. Importing them lets both surfaces
+    agree instead of the next Play silently discarding what the player chose mid-session.
+    The file is only newer than settings.json after the runtime wrote it, so a launcher change
+    made after the last session is never overwritten by stale menu state.
+    """
+    state = Path(state)
+    ini, saved = state / 'runtime.ini', state / 'settings.json'
+    # A corrupt file must never block the launcher: unparsable lines are skipped.
+    try:
+        if ini.stat().st_mtime <= saved.stat().st_mtime:
+            return {}
+        with ini.open('r', encoding='utf-8', errors='replace') as handle:
+            lines = handle.read().splitlines()
+    except (OSError, ValueError):
+        return {}
+    raw = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, value = line.partition('=')
+        raw[key.strip()] = value.strip()
+    # The runtime writes a provider as upscaler=<key> beside presentation_filter=fsr1; the launcher
+    # holds both in one choice, so read them back as that choice.
+    if raw.get('upscaler') in TEMPORAL_PROVIDERS and raw.get('presentation_filter') == 'fsr1':
+        raw['presentation_filter'] = raw['upscaler']
+    changed = {}
+    for key, (setting, allowed) in MENU_SETTING_MAP.items():
+        if key not in raw:
+            continue
+        text = raw[key]
+        try:
+            if allowed is not None:
+                candidate = text
+                if candidate not in allowed:
+                    continue
+            elif key == 'mouse_sensitivity':
+                candidate = int(text)
+                if not 10 <= candidate <= 500:
+                    continue
+            else:
+                candidate = bool(int(text))
+        except ValueError:
+            continue
+        if setting in ('mouse_sensitivity',) and type(candidate) is not int:
+            continue
+        if values.get(setting) != candidate:
+            changed[setting] = candidate
+    # fps_limit is a presentation cap the launcher owns separately: only adopt it when it is
+    # one of the engine rates the launcher itself offers.
+    try:
+        limit = int(raw.get('fps_limit', ''))
+    except ValueError:
+        limit = None
+    if limit in (30, 60) and values.get('frame_rate') != limit:
+        changed['frame_rate'] = limit
+    return changed
+
+OUTPUT_RESOLUTIONS = ('automatic', '1280x720', '1920x1080', '2560x1440', '3840x2160')
+# Launcher key -> default. Booleans arrive as bool from settings.json and as 0/1 from the CLI.
+GRAPHICS_DEFAULTS = {'output_resolution': 'automatic', 'sharpness': 0, 'anisotropy': 1, 'frames_queued': 1,
+                     'overlay_frametime': True, 'overlay_gpu': False, 'overlay_cpu': False,
+                     'overlay_memory': False, 'async_shaders': True, 'background_warmup': False,
+                     'parallel_warmup': False, 'speculative_readbacks': False}
+
+
+def graphics_settings(settings):
+    """Validate the launcher's graphics and runtime-path settings; every one reaches the runtime."""
+    values = {key: settings.get(key, default) for key, default in GRAPHICS_DEFAULTS.items()}
+    if values['output_resolution'] not in OUTPUT_RESOLUTIONS:
+        raise ValueError('Invalid output resolution')
+    for key, allowed in (('sharpness', range(0, 101)), ('anisotropy', (1, 2, 4, 8, 16)),
+                         ('frames_queued', (0, 1, 2))):
+        if type(values[key]) is not int or values[key] not in allowed:
+            raise ValueError(f'Invalid {key.replace("_", " ")}: {values[key]!r}')
+    for key, default in GRAPHICS_DEFAULTS.items():
+        if type(default) is bool:
+            if values[key] not in (True, False, 0, 1):
+                raise ValueError(f'{key.replace("_", " ").capitalize()} must be on or off')
+            values[key] = bool(values[key])
+    return values
+
+
+def write_runtime_config(user, settings):
+    sensitivity = settings.get('mouse_sensitivity', 100)
+    if type(sensitivity) is not int or not 10 <= sensitivity <= 500:
+        raise ValueError('Mouse sensitivity must be an integer from 10 to 500 percent')
+    mode = settings.get('display_mode', 'windowed')
+    if mode not in ('windowed', 'borderless', 'fullscreen'):
+        raise ValueError('Invalid display mode')
+    presentation_filter = settings.get('presentation_filter', 'fsr1')
+    if presentation_filter not in PRESENTATION_FILTERS:
+        raise ValueError('Invalid presentation filter')
+    # A temporal provider replaces the game's temporal resolve at native size (#10, #11); FSR 1
+    # still scales the result to the output, so the runtime gets both keys.
+    upscaler = presentation_filter if presentation_filter in TEMPORAL_PROVIDERS else None
+    if upscaler:
+        presentation_filter = 'fsr1'
+    # A render size the game draws itself is presented 1:1: no temporal provider, no FSR.
+    render_width = resolution.validate_width(settings.get('render_width', resolution.NATIVE_WIDTH))
+    render_resolution = 'native'
+    if render_width != resolution.NATIVE_WIDTH:
+        presentation_filter, upscaler = 'linear', None
+        render_resolution = '{}x{}'.format(*resolution.scene_size(render_width, settings.get('aspect_ratio', 'original')))
+    frame_rate = timing.validate_frame_rate(settings.get('frame_rate', 30))
+    profile = timing_profile(settings)
+    graphics = graphics_settings(settings)
+    memory = int(graphics['overlay_memory'])
+    values = {'display_mode': mode, 'vsync': int(bool(settings.get('vsync', True))),
+              'show_fps': int(bool(settings.get('show_fps', False))),
+              'fps_limit': profile['fps_limit'] if profile['fps_limit'] is not None else 0,
+              'render_resolution': render_resolution, 'presentation_filter': presentation_filter,
+              **({'upscaler': upscaler} if upscaler else {}),
+              'output_res': graphics['output_resolution'],
+              'rcas': int(graphics['sharpness'] > 0), 'rcas_strength': graphics['sharpness'],
+              # The runtime's "off" is 0; the launcher shows it as the game's own 1x.
+              'anisotropy': 0 if graphics['anisotropy'] == 1 else graphics['anisotropy'],
+              'frames_queued': graphics['frames_queued'],
+              'async_shaders': int(graphics['async_shaders']),
+              'overlay_fps': 1, 'overlay_frametime': int(graphics['overlay_frametime']),
+              'overlay_gpu': int(graphics['overlay_gpu']),
+              'overlay_cpu': int(graphics['overlay_cpu']), 'overlay_ram': memory, 'overlay_vram': memory,
+              'mouse_look': int(bool(settings.get('mouse_look', True))),
+              'mouse_sensitivity': sensitivity,
+              'mouse_invert_y': int(bool(settings.get('mouse_invert_y', False)))}
+    Path(user).mkdir(parents=True, exist_ok=True)
+    (Path(user) / 'runtime.ini').write_text(
+        '# The Order: 1886 requested settings; applied timing recipe is recorded in prepared.json.\n'
+        + ''.join(f'{k}={v}\n' for k, v in values.items()), encoding='utf-8')
+
+
+def build_command(runtime, image, game, user, check_imports=False):
+    command = [str(Path(runtime).resolve()), str(Path(image).resolve()),
+               '--app0', str(Path(game).resolve()), '--user', str(Path(user).resolve()), '--timeout', '0']
+    if check_imports:
+        command.append('--check-imports')
+    return command
+
+
+def request_runtime_close(pid):
+    """Request the runtime's normal window close path before considering force."""
+    if os.name != 'nt':
+        import signal
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except ProcessLookupError:
+            return False
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    sent = False
+
+    @callback_type
+    def close_window(window, _):
+        nonlocal sent
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if owner.value == pid and user32.PostMessageW(window, 0x0010, 0, 0):
+            sent = True
+        return True
+
+    user32.EnumWindows(close_window, 0)
+    return sent
+
+
+def run_process(command, env, log, timeout=0, stop_file=None, stop_grace_seconds=5):
+    flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    started = time.monotonic()
+    stop_file = Path(stop_file) if stop_file else None
+    timed_out = stop_requested = forced_stop = False
+    with Path(log).open('w', encoding='utf-8') as output:
+        output.write('Command: ' + json.dumps(command) + '\n')
+        output.flush()
+        if stop_file and stop_file.exists():
+            output.write('Cancelled before runtime start.\n')
+            return {'exit_code': 130, 'timed_out': False, 'stop_requested': True,
+                    'forced_stop': False, 'elapsed_seconds': 0}
+        child = subprocess.Popen(command, cwd=str(Path(env['ORDER1886_USER_DIR'])), env=env,
+                                 stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                 creationflags=flags)
+        try:
+            emit_status(f'Runtime started (PID {child.pid})', fallback=output)
+            while child.poll() is None:
+                if stop_file and stop_file.exists():
+                    stop_requested = True
+                    request_runtime_close(child.pid)
+                    try:
+                        child.wait(timeout=stop_grace_seconds)
+                    except subprocess.TimeoutExpired:
+                        forced_stop = True
+                        child.kill()
+                        child.wait()
+                    emit_status('Shutdown: forced' if forced_stop else 'Shutdown: graceful', fallback=output)
+                    break
+                if timeout and time.monotonic() - started >= timeout:
+                    timed_out = forced_stop = True
+                    child.kill()
+                    child.wait()
+                    break
+                try:
+                    child.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
+            code = 124 if timed_out else 130 if stop_requested else child.returncode
+        except BaseException:
+            child.kill()
+            child.wait()
+            raise
+    return {'exit_code': code, 'runtime_exit_code': child.returncode, 'timed_out': timed_out,
+            'stop_requested': stop_requested, 'forced_stop': forced_stop,
+            'elapsed_seconds': round(time.monotonic() - started, 3)}
+
+
+@contextlib.contextmanager
+def session_lock(user):
+    """OS-owned lock releases after a crash; prevent concurrent preparation and save writes."""
+    file = (Path(user) / 'session.lock').open('a+b')
+    try:
+        file.seek(0)
+        if os.name == 'nt':
+            import msvcrt
+            if file.read(1) == b'':
+                file.write(b'0')
+                file.flush()
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        file.close()
+        raise RuntimeError('The Order is already running or being prepared.') from error
+    try:
+        yield
+    finally:
+        file.close()
+
+
+def argument_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--game-dir', type=Path, default=default_game_dir())
+    parser.add_argument('--runtime', type=Path)
+    parser.add_argument('--stop-file', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--state-dir', type=Path, default=INSTALL_ROOT / 'user' / 'order1886')
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument('--prepare-only', action='store_true')
+    action.add_argument('--check-imports', action='store_true')
+    parser.add_argument('--timeout', type=float, default=0, help='Host watchdog in seconds; 0 waits until exit')
+    parser.add_argument('--display-mode', choices=['windowed', 'borderless', 'fullscreen'], default='windowed')
+    parser.add_argument('--presentation-filter', choices=list(PRESENTATION_FILTERS), default='fsr1',
+                        help='Output scaling filter; game rendering and timing stay native')
+    parser.add_argument('--frame-rate', type=int, choices=timing.RATES, default=30,
+                        help='30 is the native baseline; 60, 90 and 0 (unlocked) are experimental, '
+                             'with Chapter 6/9 QTE behaviour unaccepted')
+    parser.add_argument('--system-language', type=int, choices=range(30), default=1,
+                        help='PS4 system language ID; game requires installed language assets (default: English US)')
+    parser.add_argument('--fps-cap', type=int, choices=range(30, 241), default=120,
+                        help='Presentation frame cap: throttles the present thread only, never the engine rate')
+    parser.add_argument('--aspect-ratio', choices=['original', '16:9'], default='original',
+                        help='Experimental full-screen 16:9 or original cinematic aspect; requires restart')
+    parser.add_argument('--render-width', type=resolution.validate_width, default=resolution.NATIVE_WIDTH,
+                        help='Experimental render width (multiple of 16, 1280-4880, 4192 with 16:9); 1920 is the original size')
+    parser.add_argument('--vsync', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--readbacks', choices=['relaxed', 'selective', 'precise'], default='relaxed',
+                        help='GPU buffer readback policy; selective/precise are experimental and can add CPU waits')
+    parser.add_argument('--performance-capture', type=int, choices=[0, 1], default=0,
+                        help='Record frame times and slow-frame diagnostics in session logs')
+    parser.add_argument('--show-fps', type=int, choices=[0, 1], default=0)
+    parser.add_argument('--output-resolution', choices=OUTPUT_RESOLUTIONS, default='automatic',
+                        help='Presented image size before it is fitted to the window; not an internal render size')
+    parser.add_argument('--sharpness', type=int, choices=range(0, 101), default=0,
+                        help='RCAS sharpening strength in percent; 0 is off')
+    parser.add_argument('--anisotropy', type=int, choices=[1, 2, 4, 8, 16], default=1)
+    parser.add_argument('--frames-queued', type=int, choices=[0, 1, 2], default=1,
+                        help='Frames the GPU command thread may run ahead; 0 is unbounded')
+    for name, default in (('overlay-frametime', 1), ('overlay-gpu', 0), ('overlay-cpu', 0),
+                          ('overlay-memory', 0), ('async-shaders', 1), ('background-warmup', 0),
+                          ('parallel-warmup', 0), ('speculative-readbacks', 0)):
+        parser.add_argument('--' + name, type=int, choices=[0, 1], default=default)
+    parser.add_argument('--mouse-look', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--mouse-sensitivity', type=int, default=100,
+                        help='Mouse-to-stick sensitivity, 10 to 500 percent (default: 100)')
+    parser.add_argument('--mouse-invert-y', type=int, choices=[0, 1], default=0)
+    parser.add_argument('--keyboard-bindings', default='{}', help='JSON object mapping PS4 digital buttons to SDL key names')
+    parser.add_argument('--controller-bindings', default='{}', help='JSON object mapping PS4 digital buttons to SDL gamepad button names')
+    parser.add_argument('--mods-dir', default='', help='Folder containing explicitly selected asset mod folders')
+    parser.add_argument('--mods-enabled', type=int, choices=[0, 1], default=0)
+    parser.add_argument('--mods-order', default='[]', help='JSON list of enabled mod folder names; later entries win')
+    parser.add_argument('--button-prompts', choices=prompts.SETS, default='playstation',
+                        help="Button prompt artwork: the game's own PlayStation prompts, or "
+                             "keyboard and mouse (built from your game files on first use; "
+                             "the key caps follow your keyboard mapping)")
+    parser.add_argument('--disable-effects', default='',
+                        help='Comma-separated post effects to turn off in the prepared image ('
+                             + ', '.join(post_effects.EFFECTS) + '); empty keeps them all')
+    parser.add_argument('--patches', default='',
+                        help='Comma-separated catalogued patch ids applied inside the prepared image; empty applies none')
+    # Live switches the runtime honours through its own toggle file; both are experimental.
+    parser.add_argument('--synchronous-recording', action='store_true',
+                        help='Record Vulkan commands on the submitting thread instead of the '
+                             'recording thread (experimental, unqualified)')
+    parser.add_argument('--texture-update-locking', action='store_true',
+                        help='Take the guest-fault mutex for texture update checks instead of '
+                             'the lock-free flag check (experimental, unqualified)')
+    # Opt-in runtime switches the launcher owns as settings. Without a flag the backend never
+    # sees them and the launcher's toggle is decorative.
+    parser.add_argument('--htile', action='store_true',
+                        help='Opt in to the unqualified HTILE metadata adaptation')
+    parser.add_argument('--in-game-menu', action='store_true',
+                        help='Allow the in-game settings menu (unqualified for gameplay)')
+    return parser
+
+
+def main(argv=None):
+    parser = argument_parser()
+    args = parser.parse_args(argv)
+    if not 10 <= args.mouse_sensitivity <= 500:
+        parser.error('--mouse-sensitivity must be from 10 to 500')
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        parser.error('--timeout must be a finite nonnegative number')
+    try:
+        for kind in ('keyboard', 'controller'):
+            mapping = json.loads(getattr(args, kind + '_bindings'))
+            inputs.validate(mapping, kind)
+            setattr(args, kind + '_bindings', mapping)
+        args.mods_dir = str(mods.resolve_root(args.mods_dir, ROOT))
+        game, user = mods.safe_path(args.game_dir), mods.safe_path(args.state_dir)
+        mods.safe_path(user / 'session.lock')
+        if args.mods_dir:
+            mod_root = mods.safe_path(args.mods_dir)
+            if user == mod_root or mod_root in user.parents:
+                raise ValueError('State directory must be outside the mod source folder.')
+    except (OSError, ValueError) as error:
+        emit_status(f'The Order: {error}', error=True)
+        return 2
+    if user == game or game in user.parents:
+        emit_status('State directory must be outside the game folder.', error=True)
+        return 2
+    diagnostic_log = user / 'logs/backend.log'
+    try:
+        user.mkdir(parents=True, exist_ok=True)
+        with session_lock(user):
+            mod_order = json.loads(args.mods_order)
+            mods.validate_config(args.mods_dir, bool(args.mods_enabled), mod_order)
+            metadata = inspect_game(game)
+            if args.stop_file and args.stop_file.exists():
+                emit_status('Cancelled before preparation.', fallback=diagnostic_log)
+                return 130
+            emit_status(f'{metadata["TITLE"]} | {metadata["TITLE_ID"]} | APP_VER {metadata.get("APP_VER")} | VERSION {metadata.get("VERSION")}', fallback=diagnostic_log)
+            if editions.experimental(metadata['TITLE_ID']):
+                emit_status(f'{metadata["TITLE_ID"]} is an experimental edition: only '
+                            f'{editions.VERIFIED_TITLE_ID} has been run with a real dump. If it fails, '
+                            'report it with logs/last-run.json and the newest log.', fallback=diagnostic_log)
+            language = editions.system_language(metadata['TITLE_ID'], args.system_language)
+            if language != args.system_language:
+                emit_status(f'{metadata["TITLE_ID"]} has no assets for system language {args.system_language}; '
+                            f'using {language}.', fallback=diagnostic_log)
+                args.system_language = language
+            runtime = None if args.prepare_only else find_runtime(args.runtime)
+            if not args.prepare_only and runtime is None:
+                raise ValueError('Order runtime not found in this installation. Build build.sh or explicitly select a runtime in Settings.')
+            if runtime is not None:
+                validate_input_settings(runtime, vars(args))
+            if args.frame_rate != 30:
+                emit_status(timing.recipe(args.frame_rate)['warning'], fallback=diagnostic_log)
+            if args.aspect_ratio == '16:9':
+                emit_status(display.WARNING, fallback=diagnostic_log)
+            if args.render_width != resolution.NATIVE_WIDTH:
+                emit_status(resolution.WARNING, fallback=diagnostic_log)
+            selected = [name.strip() for name in str(args.patches).split(',') if name.strip()]
+            disabled_effects = [name.strip() for name in str(args.disable_effects).split(',') if name.strip()]
+            if disabled_effects:
+                emit_status(post_effects.WARNING, fallback=diagnostic_log)
+            prepared = prepare_game(game, user / 'prepared', frame_rate=args.frame_rate,
+                                    aspect_ratio=args.aspect_ratio, patches=selected,
+                                    disabled_effects=disabled_effects, render_width=args.render_width)
+            if args.render_width != resolution.NATIVE_WIDTH and not (
+                    prepared.get('resolution_profile', {}).get('applied') is True
+                    and prepared['resolution_profile'].get('recipe_sha256') == resolution.recipe_sha256(args.render_width, args.aspect_ratio)):
+                raise ValueError('A non-original render size requires a verified prepared resolution recipe')
+            if disabled_effects and not (prepared.get('post_effects_profile', {}).get('applied') is True
+                    and prepared['post_effects_profile'].get('recipe_sha256') == post_effects.recipe_sha256(disabled_effects)):
+                raise ValueError('Turning post effects off requires a verified prepared post-effect recipe')
+            if args.aspect_ratio == '16:9' and not (prepared.get('display_profile', {}).get('applied') is True
+                    and prepared['display_profile'].get('source_verified') is True
+                    and prepared['display_profile'].get('recipe_sha256') == display.recipe_sha256('16:9')):
+                raise ValueError('Full-screen 16:9 requires a verified prepared aspect recipe')
+            if args.frame_rate != 30 and not (prepared.get('frame_rate_profile', {}).get('applied') is True
+                    and prepared['frame_rate_profile'].get('source_verified') is True
+                    and prepared['frame_rate_profile'].get('engine_fps') == args.frame_rate
+                    and prepared['frame_rate_profile'].get('host_fps_limit') == args.frame_rate
+                    and prepared['frame_rate_profile'].get('recipe_sha256') == timing.recipe_sha256(args.frame_rate)):
+                raise ValueError(f'{timing.FEATURES[args.frame_rate]} requires a verified prepared timing recipe')
+            if args.prepare_only:
+                return 0
+            write_runtime_config(user, vars(args))
+            # Use the supplied official emblem for the runtime window as well.
+            try:
+                from PIL import Image
+                bundled_icon = Path(getattr(sys, '_MEIPASS', ROOT)) / 'launcher/order1886/app-icon.png'
+                with Image.open(bundled_icon if bundled_icon.is_file() else game / 'sce_sys/icon0.png') as icon:
+                    icon.convert('RGB').save(user / 'window_icon.bmp')
+            except (ImportError, OSError):
+                pass
+            if not args.check_imports:
+                save_backup.backup(user)
+            env = runtime_environment(runtime, user, vars(args))
+            mode = 'imports' if args.check_imports else 'boot'
+            stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+            logs = user / 'logs'
+            logs.mkdir(exist_ok=True)
+            log = logs / f'{stamp}-{mode}.log'
+            prompt_files = [] if args.check_imports else prompts.prepare(
+                game, user, args.button_prompts, log=lambda line: emit_status(line, fallback=diagnostic_log),
+                bindings=args.keyboard_bindings)
+            mounted_game = mods.build_overlay(game, user, args.mods_dir,
+                                             bool(args.mods_enabled) and not args.check_imports, mod_order,
+                                             extra=prompt_files)
+            command = build_command(runtime, user / 'prepared/boot-linked.bin', mounted_game, user, args.check_imports)
+            timing_values = timing_profile(vars(args))
+            report = {'mode': mode, 'started_utc': stamp, **runtime_identity(runtime),
+                      'game': str(game), 'mounted_game': str(mounted_game),
+                      'button_prompts': args.button_prompts,
+                      'mods': {'enabled': bool(args.mods_enabled) and not args.check_imports,
+                               'folder': args.mods_dir, 'order': mod_order},
+                      'title_id': metadata['TITLE_ID'], 'image_sha256': prepared['image_sha256'],
+                      'game_metadata': {key: metadata.get(key) for key in
+                                        ('TITLE', 'TITLE_ID', 'APP_VER', 'VERSION', 'INSTALL_DIR_SAVEDATA', 'SYSTEM_VER')},
+                      'shader_cache_abi': SHADER_CACHE_ABI,
+                      'log': str(log), 'status': 'running', 'gameplay_verified': False,
+                      'command': command, 'config_sha256': sha256(user / 'runtime.ini'),
+                      'runtime_environment': {k: v for k, v in env.items() if k.startswith('ORDER1886_')},
+                       'frame_rate_profile': prepared.get('frame_rate_profile'),
+                       'display_profile': prepared.get('display_profile'),
+                       'post_effects_profile': prepared.get('post_effects_profile'),
+                       'configuration': {
+                           'timing': timing_values,
+                           'catalogue_patches': prepared.get('catalogue_patches', []),
+                           'switches': {
+                               'htile_unqualified': bool(getattr(args, 'htile', False)),
+                               'in_game_menu': bool(getattr(args, 'in_game_menu', False)),
+                               'readbacks': args.readbacks,
+                               'effect_toggles': effect_toggle_mask(runtime, vars(args)),
+                           },
+                       },
+                       'settings': {'display_mode': args.display_mode, 'vsync': args.vsync,
+                                    'show_fps': args.show_fps, 'presentation_filter': args.presentation_filter,
+                                    'performance_capture': bool(args.performance_capture),
+                                    'frame_rate': args.frame_rate,
+                                    'fps_limit': timing_values['fps_limit'],
+                                    'aspect_ratio': args.aspect_ratio, 'render_width': args.render_width,
+                                    'system_language': args.system_language,
+                                    **graphics_settings(vars(args))}}
+            write_json(logs / 'last-run.json', report)
+            emit_status(f'Log: {log}', fallback=diagnostic_log)
+            emit_status(f'Runtime: {report["runtime"]} | SHA256 {report["runtime_sha256"]}', fallback=diagnostic_log)
+            emit_status('Experimental compatibility run. Gameplay and performance are not yet verified.', fallback=diagnostic_log)
+            try:
+                report.update(run_process(command, env, log, args.timeout or (60 if args.check_imports else 0), args.stop_file))
+            except (OSError, KeyboardInterrupt) as error:
+                report.update(status='interrupted' if isinstance(error, KeyboardInterrupt) else 'launch_failed',
+                              exit_code=130 if isinstance(error, KeyboardInterrupt) else 2,
+                              stop_reason=str(error) or 'Interrupted', timed_out=False)
+                write_json(log.with_suffix('.json'), report)
+                write_json(logs / 'last-run.json', report)
+                emit_status(f'Runtime {report["status"]}: {report["stop_reason"]}', error=True, fallback=diagnostic_log)
+                return report['exit_code']
+            tail = log.read_text(encoding='utf-8', errors='replace')
+            missing = re.search(r'Imports: (\d+) missing', tail)
+            report['missing_imports'] = int(missing[1]) if missing else None
+            stops = [line for line in tail.splitlines() if 'STOP:' in line or 'unresolved' in line.lower()]
+            closed = [line for line in tail.splitlines() if line.startswith('Window: closed by user')]
+            report['stop_reason'] = stops[-1] if stops else closed[-1] if closed else None
+            report['status'] = ('timed_out' if report['timed_out'] else
+                                'stopped' if report.get('stop_requested') else
+                                'failed' if report['exit_code'] else 'process_exited')
+            write_json(log.with_suffix('.json'), report)
+            write_json(logs / 'last-run.json', report)
+            if missing:
+                emit_status(f'Import audit: {report["missing_imports"]} missing.', fallback=diagnostic_log)
+            if report['stop_reason']:
+                emit_status(report['stop_reason'], fallback=diagnostic_log)
+            emit_status(f'Runtime {report["status"]}; exit {report["exit_code"]}. Log: {log}', fallback=diagnostic_log)
+            return report['exit_code']
+    except (OSError, ValueError, RuntimeError) as error:
+        emit_status(f'The Order: {error}', error=True, fallback=diagnostic_log)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
