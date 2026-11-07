@@ -438,7 +438,7 @@ def runtime_environment(runtime, user, settings=None, inherited=None):
         'ORDER1886_HTILE': '1' if htile else '0',
         # Reuse validated cached pipelines before playback rather than compiling during it,
         # unless the player opted in to warming them up while the game runs.
-        'ORDER1886_PIPELINE_BINARIES': '0',
+        'ORDER1886_PIPELINE_BINARIES': '1',
         'ORDER1886_BACKGROUND_WARMUP': '1' if graphics['background_warmup'] else '0',
         'ORDER1886_PARALLEL_WARMUP': '1' if graphics['parallel_warmup'] else '0',
         'ORDER1886_DEFERRED_READBACK': '1' if graphics['speculative_readbacks'] else '0',
