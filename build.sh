@@ -104,7 +104,8 @@ if [[ ! -f gpu/third_party/xbyak/xbyak/xbyak.h || ! -f gpu/third_party/imgui/img
     git submodule update --init --recursive
 fi
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DORDER1886_PGO="$pgo" \
-    -DORDER1886_LTO="${ORDER1886_LTO:-ON}" -DORDER1886_PGO_DIR="$PWD/pgo" >/dev/null
+    -DORDER1886_LTO="${ORDER1886_LTO:-ON}" -DORDER1886_PGO_DIR="$PWD/pgo" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${CMAKE_SHARED_LINKER_FLAGS:-} ${libgpu[*]}" > out/gpu-cmake.log 2>&1 || { tail -20 out/gpu-cmake.log >&2; exit 1; }
 echo "GPU library: PGO $pgo, LTO ${ORDER1886_LTO:-ON}"
 # A failed GPU build must stop here: an older libps4gpu.so would otherwise be used silently.
 if ! ninja -C out/gpu ps4gpu > out/gpu-build.log 2>&1; then
@@ -112,6 +113,10 @@ if ! ninja -C out/gpu ps4gpu > out/gpu-build.log 2>&1; then
     echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
 fi
 # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
+# libps4gpu.so gets its own $ORIGIN runpath so its private deps (Zydis) resolve from the
+# gpu/ dir too — the loader applies the executable's RUNPATH only to the executable's own
+# NEEDED entries, and the launcher does not set LD_LIBRARY_PATH.
+libgpu=(-Wl,-rpath,'$ORIGIN')
 gpu=(-Lout/gpu -lps4gpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
 runtime=(src/runtime*.c)
 # Third-party decoders: compiled once, without this project's -Werror policy.
