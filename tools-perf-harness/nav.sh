@@ -19,6 +19,12 @@ case "$1" in
           *) echo "key not allowed: $2" >> "$LOG"; exit 2;;
         esac ;;
   down) CMD=(keydown "$2");; up) CMD=(keyup "$2");;
+  hold) case "$2" in
+          Space) K=57;; Return) K=28;; Escape) K=1;; w) K=17;; a) K=30;; s) K=31;; d) K=32;;
+          *) echo "hold key not allowed: $2" >> "$LOG"; exit 2;;
+        esac
+        ydotool key "$K:1" 2>> "$LOG"; sleep 0.22; ydotool key "$K:0" 2>> "$LOG"
+        echo "$(date -Is) SEND hold $2 (held 220ms)" >> "$LOG"; exit 0 ;;
   move) CMD=(mousemove --relative "$2" "$3");;
   click) CMD=(click -- 0x110);;
   *) echo "verb not allowed: $1" >> "$LOG"; exit 2;;

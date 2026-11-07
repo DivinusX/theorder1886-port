@@ -22,8 +22,9 @@ if (( BUDGET + DUR + 60 > BUDGET_MAX )); then echo "LIVE BUDGET EXCEEDED ($BUDGE
 if [[ ! -d "$STATE" ]]; then
     cp -a --reflink=auto "$W"/backup-user-*/order1886 "$STATE"
 fi
+mkdir -p "$STATE/gpu/native-ps4-v1"   # launcher env override only lands if the dir exists
 if [[ $CACHE == cold ]]; then
-    rm -rf "$STATE/gpu" "$STATE/cache" "$STATE/shader"
+    rm -rf "$STATE/gpu" "$STATE/cache" "$STATE/shader"; mkdir -p "$STATE/gpu/native-ps4-v1"
 fi
 # mesa driver shader cache: per-process dir, cold = fresh, warm = shared
 MESA_DIR="$W/mesa-cache"
@@ -87,7 +88,7 @@ SAMPLER=$!
 WD=$!
 wait "$WD" 2>/dev/null || true
 kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null || true
-pgrep -f "bin/order1886-runtime" >/dev/null && { echo "RUNTIME STILL ALIVE - killing"; pkill -9 -f "bin/order1886-runtime"; }
+pgrep -f "bin/order1886-runtime" >/dev/null && { echo "RUNTIME STILL ALIVE - killing"; pkill -9 -f "bin/order1886-runtime"; } || true
 
 # --- collect artifacts ---
 cp -f "$STATE/logs/last-run.json" "$RUNDIR/last-run.json" 2>/dev/null || true
@@ -96,7 +97,7 @@ cp -f "$BOOT" "$RUNDIR/boot.log" 2>/dev/null || true
 TR=$(ls -t "$STATE/logs/"performance-*.csv 2>/dev/null | head -1 || true)
 cp -f "$TR" "$RUNDIR/trace.csv" 2>/dev/null || true
 cp -f "$STATE/settings.json" "$RUNDIR/settings-used.json" 2>/dev/null || true
-mkdir -p "$RUNDIR/screenshots"; find "$STATE" "$INSTALL/bin" -maxdepth 4 -name "*.png" -newer "$RUNDIR/backend.log" -path "*hots*" -exec cp -f {} "$RUNDIR/screenshots/" \; 2>/dev/null || true
+mkdir -p "$RUNDIR/screenshots"; find "$STATE" -maxdepth 4 -name "*.png" -newer "$RUNDIR/backend.log" -path "*hots*" -exec cp -f {} "$RUNDIR/screenshots/" \; 2>/dev/null || true
 echo "$(( BUDGET + DUR ))" > "$BUDGET_FILE"
 "$PY" "$W/harness/metrics.py" "$LABEL" "$RUNDIR/trace.csv" "$RUNDIR/boot.log" "$RUNDIR/sampler.csv" "$RUNDIR/metrics.json" | tail -3
 echo "RUNDIR=$RUNDIR budget=$(cat "$BUDGET_FILE")s"
