@@ -87,7 +87,7 @@ SAMPLER=$!
 ) &
 WD=$!
 wait "$WD" 2>/dev/null || true
-kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null || true
+kill "$SAMPLER" 2>/dev/null || true; wait "$SAMPLER" 2>/dev/null || true
 pgrep -f "bin/order1886-runtime" >/dev/null && { echo "RUNTIME STILL ALIVE - killing"; pkill -9 -f "bin/order1886-runtime"; } || true
 
 # --- collect artifacts ---
